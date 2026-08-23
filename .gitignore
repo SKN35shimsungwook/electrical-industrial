@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+data/quiz.db
+.streamlit/secrets.toml
+data/raw_cbt/
+data/sources/
+tools/_reports/
