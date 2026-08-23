@@ -1,0 +1,406 @@
+# -*- coding: utf-8 -*-
+"""SQLite 데이터 접근 계층. app.py는 이 모듈을 통해서만 DB에 접근한다.
+여러 시험(exam)을 한 DB에서 다루므로, 사용자 기록 조회는 대부분 exam으로 스코프한다."""
+import datetime
+import json
+import os
+import sqlite3
+
+DB_PATH = os.path.join(os.path.dirname(__file__), "data", "quiz.db")
+
+
+def get_connection():
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def get_all_questions(con, exam):
+    return con.execute("SELECT * FROM questions WHERE exam=? ORDER BY id", (exam,)).fetchall()
+
+
+def get_cbt_rounds(con, exam):
+    rows = con.execute(
+        "SELECT DISTINCT round FROM questions WHERE exam=? AND source='cbt' AND round<>'' ORDER BY round",
+        (exam,),
+    ).fetchall()
+    return [r["round"] for r in rows]
+
+
+def get_question(con, qid):
+    return con.execute("SELECT * FROM questions WHERE id=?", (qid,)).fetchone()
+
+
+def record_attempt(con, user, question_id, chosen, is_correct):
+    con.execute(
+        "INSERT INTO attempts(user, question_id, chosen, is_correct, ts) VALUES (?,?,?,?,?)",
+        (user, question_id, chosen, int(is_correct), datetime.datetime.now().isoformat()),
+    )
+    con.commit()
+
+
+def get_overall_stats(con, user, exam):
+    row = con.execute(
+        """SELECT COUNT(*) AS seen, SUM(a.is_correct) AS correct
+           FROM attempts a JOIN questions q ON a.question_id = q.id
+           WHERE a.user=? AND q.exam=?""",
+        (user, exam),
+    ).fetchone()
+    seen = row["seen"] or 0
+    correct = row["correct"] or 0
+    rate = round(correct / seen * 100) if seen else 0
+    return {"seen": seen, "correct": correct, "rate": rate}
+
+
+def get_per_question_stats(con, user, exam):
+    """qid -> {seen, correct, wrong, last_result, last_chosen, last_ts}"""
+    rows = con.execute(
+        """SELECT a.question_id AS question_id, a.chosen AS chosen, a.is_correct AS is_correct, a.ts AS ts
+           FROM attempts a JOIN questions q ON a.question_id = q.id
+           WHERE a.user=? AND q.exam=? ORDER BY a.ts ASC""",
+        (user, exam),
+    ).fetchall()
+    stats = {}
+    for r in rows:
+        qid = r["question_id"]
+        s = stats.setdefault(
+            qid,
+            {"seen": 0, "correct": 0, "wrong": 0, "last_result": None, "last_chosen": None, "last_ts": None},
+        )
+        s["seen"] += 1
+        if r["is_correct"]:
+            s["correct"] += 1
+            s["last_result"] = "O"
+        else:
+            s["wrong"] += 1
+            s["last_result"] = "X"
+        s["last_chosen"] = r["chosen"]
+        s["last_ts"] = r["ts"]
+    return stats
+
+
+def get_wrong_attempt_history(con, user, qid):
+    """이 문제에서 틀렸을 때 고른 보기 번호(1~4) 목록, 시간순."""
+    rows = con.execute(
+        "SELECT chosen FROM attempts WHERE user=? AND question_id=? AND is_correct=0 ORDER BY ts ASC",
+        (user, qid),
+    ).fetchall()
+    return [r["chosen"] for r in rows]
+
+
+def get_wrong_question_ids(con, user, exam):
+    stats = get_per_question_stats(con, user, exam)
+    hidden = get_hidden_note_ids(con, user)
+    need, done = [], []
+    for qid, s in stats.items():
+        if s["wrong"] == 0 or qid in hidden:
+            continue
+        (need if s["last_result"] == "X" else done).append(qid)
+    need.sort(key=lambda qid: stats[qid]["last_ts"], reverse=True)
+    done.sort(key=lambda qid: stats[qid]["last_ts"], reverse=True)
+    return need, done, stats
+
+
+def get_tag_stats(con, user, exam, source=None):
+    """source: None(전체) / "concept"(퀴즈) / "cbt"(CBT 문제)로 집계 범위를 좁힐 수 있다."""
+    sql = """
+        SELECT q.subject AS subject, q.tag AS tag, a.question_id AS qid, a.is_correct AS is_correct
+        FROM attempts a JOIN questions q ON a.question_id = q.id
+        WHERE a.user = ? AND q.exam = ?
+        """
+    params = [user, exam]
+    if source is not None:
+        sql += " AND q.source = ?"
+        params.append(source)
+    rows = con.execute(sql, params).fetchall()
+    agg = {}
+    for r in rows:
+        key = (r["subject"], r["tag"])
+        d = agg.setdefault(key, {"subject": r["subject"], "tag": r["tag"], "seen": 0, "wrong": 0, "qids": set()})
+        d["seen"] += 1
+        if not r["is_correct"]:
+            d["wrong"] += 1
+        d["qids"].add(r["qid"])
+    result = [v for v in agg.values() if v["wrong"] > 0]
+    result.sort(key=lambda v: (-v["wrong"], -(v["wrong"] / v["seen"])))
+    return result
+
+
+def get_subject_stats(con, user, exam):
+    """취약과목 자동 우선순위: subject별 오답률."""
+    rows = con.execute(
+        """
+        SELECT q.subject AS subject, a.is_correct AS is_correct
+        FROM attempts a JOIN questions q ON a.question_id = q.id
+        WHERE a.user = ? AND q.exam = ?
+        """,
+        (user, exam),
+    ).fetchall()
+    agg = {}
+    for r in rows:
+        d = agg.setdefault(r["subject"], {"subject": r["subject"], "seen": 0, "wrong": 0})
+        d["seen"] += 1
+        if not r["is_correct"]:
+            d["wrong"] += 1
+    result = list(agg.values())
+    result.sort(key=lambda v: -(v["wrong"] / v["seen"]) if v["seen"] else 0)
+    return result
+
+
+def reset_user(con, user, exam):
+    con.execute(
+        "DELETE FROM attempts WHERE user=? AND question_id IN (SELECT id FROM questions WHERE exam=?)",
+        (user, exam),
+    )
+    con.commit()
+
+
+def clear_question_history(con, user, qid):
+    con.execute("DELETE FROM attempts WHERE user=? AND question_id=?", (user, qid))
+    con.commit()
+
+
+def hide_note(con, user, qid):
+    con.execute(
+        "INSERT OR IGNORE INTO note_hidden(user, question_id, ts) VALUES (?,?,?)",
+        (user, qid, datetime.datetime.now().isoformat()),
+    )
+    con.commit()
+
+
+def hide_notes(con, user, qids):
+    now = datetime.datetime.now().isoformat()
+    con.executemany(
+        "INSERT OR IGNORE INTO note_hidden(user, question_id, ts) VALUES (?,?,?)",
+        [(user, qid, now) for qid in qids],
+    )
+    con.commit()
+
+
+def get_hidden_note_ids(con, user):
+    rows = con.execute("SELECT question_id FROM note_hidden WHERE user=?", (user,)).fetchall()
+    return {r["question_id"] for r in rows}
+
+
+def save_coach_message(con, user, qid, role, text):
+    con.execute(
+        "INSERT INTO coach_chat(user, question_id, role, text, ts) VALUES (?,?,?,?,?)",
+        (user, qid, role, text, datetime.datetime.now().isoformat()),
+    )
+    con.commit()
+
+
+def get_coach_messages(con, user, qid):
+    rows = con.execute(
+        "SELECT role, text FROM coach_chat WHERE user=? AND question_id=? ORDER BY ts ASC",
+        (user, qid),
+    ).fetchall()
+    return [{"role": r["role"], "text": r["text"]} for r in rows]
+
+
+def add_flag(con, user, qid):
+    con.execute(
+        "INSERT OR IGNORE INTO flags(user, question_id, ts) VALUES (?,?,?)",
+        (user, qid, datetime.datetime.now().isoformat()),
+    )
+    con.commit()
+
+
+def remove_flag(con, user, qid):
+    con.execute("DELETE FROM flags WHERE user=? AND question_id=?", (user, qid))
+    con.commit()
+
+
+def is_flagged(con, user, qid):
+    row = con.execute("SELECT 1 FROM flags WHERE user=? AND question_id=?", (user, qid)).fetchone()
+    return row is not None
+
+
+def get_flagged_ids(con, user, exam):
+    rows = con.execute(
+        """SELECT f.question_id AS question_id FROM flags f JOIN questions q ON f.question_id=q.id
+           WHERE f.user=? AND q.exam=? ORDER BY f.ts DESC""",
+        (user, exam),
+    ).fetchall()
+    return [r["question_id"] for r in rows]
+
+
+def add_ox_wrong(con, user, concept_qid):
+    con.execute(
+        "INSERT OR REPLACE INTO ox_wrong(user, concept_qid, ts) VALUES (?,?,?)",
+        (user, concept_qid, datetime.datetime.now().isoformat()),
+    )
+    con.commit()
+
+
+def get_ox_wrong_ids(con, user, exam):
+    rows = con.execute(
+        """SELECT o.concept_qid AS concept_qid FROM ox_wrong o JOIN questions q ON o.concept_qid=q.id
+           WHERE o.user=? AND q.exam=? ORDER BY o.ts DESC""",
+        (user, exam),
+    ).fetchall()
+    return [r["concept_qid"] for r in rows]
+
+
+def clear_ox_wrong(con, user, concept_qid=None):
+    if concept_qid is None:
+        con.execute("DELETE FROM ox_wrong WHERE user=?", (user,))
+    else:
+        con.execute("DELETE FROM ox_wrong WHERE user=? AND concept_qid=?", (user, concept_qid))
+    con.commit()
+
+
+def add_card_wrong(con, user, concept_qid):
+    con.execute(
+        "INSERT OR REPLACE INTO card_wrong(user, concept_qid, ts) VALUES (?,?,?)",
+        (user, concept_qid, datetime.datetime.now().isoformat()),
+    )
+    con.commit()
+
+
+def get_card_wrong_ids(con, user, exam):
+    rows = con.execute(
+        """SELECT c.concept_qid AS concept_qid FROM card_wrong c JOIN questions q ON c.concept_qid=q.id
+           WHERE c.user=? AND q.exam=? ORDER BY c.ts DESC""",
+        (user, exam),
+    ).fetchall()
+    return [r["concept_qid"] for r in rows]
+
+
+def clear_card_wrong(con, user, concept_qid=None):
+    if concept_qid is None:
+        con.execute("DELETE FROM card_wrong WHERE user=?", (user,))
+    else:
+        con.execute("DELETE FROM card_wrong WHERE user=? AND concept_qid=?", (user, concept_qid))
+    con.commit()
+
+
+def get_study_goal(con, user, exam):
+    row = con.execute(
+        "SELECT exam_date, daily_target FROM study_goal WHERE user=? AND exam=?", (user, exam)
+    ).fetchone()
+    if row is None:
+        return {"exam_date": None, "daily_target": 20}
+    return {"exam_date": row["exam_date"], "daily_target": row["daily_target"]}
+
+
+def set_study_goal(con, user, exam, exam_date, daily_target):
+    con.execute(
+        """INSERT INTO study_goal(user, exam, exam_date, daily_target) VALUES (?,?,?,?)
+           ON CONFLICT(user, exam) DO UPDATE SET exam_date=excluded.exam_date, daily_target=excluded.daily_target""",
+        (user, exam, exam_date, daily_target),
+    )
+    con.commit()
+
+
+def get_today_solved_count(con, user, exam):
+    today = datetime.date.today().isoformat()
+    row = con.execute(
+        """SELECT COUNT(*) AS c FROM attempts a JOIN questions q ON a.question_id=q.id
+           WHERE a.user=? AND q.exam=? AND substr(a.ts,1,10)=?""",
+        (user, exam, today),
+    ).fetchone()
+    return row["c"] or 0
+
+
+# =====================================================================
+# 마인드맵: 과목 전체(concept) / 약점(weak) 지도는 (user,exam,subject,kind)당 하나,
+# 나만의 마인드맵(custom)은 title로 여러 개를 구분한다. 그래프(카테고리/노드/엣지)는
+# JSON 하나로 저장한다.
+# =====================================================================
+def save_mindmap_board(con, user, exam, subject, kind, title, data):
+    ts = datetime.datetime.now().isoformat()
+    payload = json.dumps(data, ensure_ascii=False)
+    con.execute(
+        """INSERT INTO mindmap_board(user, exam, subject, kind, title, data, ts)
+           VALUES (?,?,?,?,?,?,?)
+           ON CONFLICT(user, exam, subject, kind, title)
+           DO UPDATE SET data=excluded.data, ts=excluded.ts""",
+        (user, exam, subject, kind, title, payload, ts),
+    )
+    con.commit()
+    return get_mindmap_board(con, user, exam, subject, kind, title)
+
+
+def save_mindmap_board_data(con, board_id, data):
+    """이미 있는 보드의 그래프 내용만 갱신한다(가지 추가, 취약점 분석 캐시 등 부분 수정용).
+    user/exam/subject/kind/title 키를 다시 몰라도 board_id만으로 바로 갱신할 수 있다."""
+    con.execute(
+        "UPDATE mindmap_board SET data=?, ts=? WHERE id=?",
+        (json.dumps(data, ensure_ascii=False), datetime.datetime.now().isoformat(), board_id),
+    )
+    con.commit()
+
+
+def get_mindmap_board(con, user, exam, subject, kind, title=""):
+    row = con.execute(
+        """SELECT id, data, ts FROM mindmap_board
+           WHERE user=? AND exam=? AND subject=? AND kind=? AND title=?""",
+        (user, exam, subject, kind, title),
+    ).fetchone()
+    if row is None:
+        return None
+    return {"id": row["id"], "data": json.loads(row["data"]), "ts": row["ts"]}
+
+
+def get_mindmap_board_by_id(con, board_id):
+    row = con.execute("SELECT id, data, ts FROM mindmap_board WHERE id=?", (board_id,)).fetchone()
+    if row is None:
+        return None
+    return {"id": row["id"], "data": json.loads(row["data"]), "ts": row["ts"]}
+
+
+def list_custom_boards(con, user, exam):
+    rows = con.execute(
+        """SELECT id, title, ts FROM mindmap_board
+           WHERE user=? AND exam=? AND kind='custom' ORDER BY ts DESC""",
+        (user, exam),
+    ).fetchall()
+    return [{"id": r["id"], "title": r["title"], "ts": r["ts"]} for r in rows]
+
+
+def delete_mindmap_board(con, board_id):
+    con.execute("DELETE FROM mindmap_comment WHERE board_id=?", (board_id,))
+    con.execute("DELETE FROM mindmap_board WHERE id=?", (board_id,))
+    con.commit()
+
+
+def add_mindmap_comment(con, board_id, node_key, user, text):
+    con.execute(
+        "INSERT INTO mindmap_comment(board_id, node_key, user, text, ts) VALUES (?,?,?,?,?)",
+        (board_id, node_key, user, text, datetime.datetime.now().isoformat()),
+    )
+    con.commit()
+
+
+def get_mindmap_comments(con, board_id, node_key):
+    rows = con.execute(
+        "SELECT id, text, ts FROM mindmap_comment WHERE board_id=? AND node_key=? ORDER BY ts ASC",
+        (board_id, node_key),
+    ).fetchall()
+    return [{"id": r["id"], "text": r["text"], "ts": r["ts"]} for r in rows]
+
+
+def get_mindmap_comment_counts(con, board_id):
+    rows = con.execute(
+        "SELECT node_key, COUNT(*) AS c FROM mindmap_comment WHERE board_id=? GROUP BY node_key",
+        (board_id,),
+    ).fetchall()
+    return {r["node_key"]: r["c"] for r in rows}
+
+
+def delete_mindmap_comment(con, comment_id):
+    con.execute("DELETE FROM mindmap_comment WHERE id=?", (comment_id,))
+    con.commit()
+
+
+def delete_mindmap_comments_for_nodes(con, board_id, node_keys):
+    """가지(개념 노드)를 삭제할 때 그 노드와 하위 노드들에 달린 맨션(댓글)도 같이 정리한다."""
+    if not node_keys:
+        return
+    placeholders = ",".join("?" for _ in node_keys)
+    con.execute(
+        f"DELETE FROM mindmap_comment WHERE board_id=? AND node_key IN ({placeholders})",
+        (board_id, *node_keys),
+    )
+    con.commit()
