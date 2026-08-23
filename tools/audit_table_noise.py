@@ -1,0 +1,70 @@
+# -*- coding: utf-8 -*-
+"""표 데이터가 뒤섞인 문제 스캔.
+- <표이름> 마커
+- 숫자가 6자리 이상 연속으로 붙어있는 경우
+- 선택지 끝의 어색한 트레일링 "-"
+- 표 헤더 단어(도착시간/실행시간 등)가 공백 없이 붙어있는 경우
+- "문자+숫자"(예: A06, P103)가 3번 이상 연속으로 나열된 경우(스케줄링 표 병합 흔적)
+"""
+import csv
+import json
+import os
+import re
+
+BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PATH = os.path.join(BASE, "data", "cbt_questions.csv")
+OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_reports")
+os.makedirs(OUT_DIR, exist_ok=True)
+
+with open(PATH, encoding="utf-8-sig") as f:
+    rows = list(csv.DictReader(f))
+
+TABLE_HEADER_WORDS = [
+    "도착시간", "실행시간", "버스트시간", "버스트타임", "완료시간",
+    "서비스시간", "대기시간", "우선순위", "반환시간", "처리시간", "요청시간",
+    "사용시간", "소요시간", "CPU",
+]
+# 헤더 단어 사이에 공백이 있어도(예: "도착 시간CPU 사용시간") 잡아내기 위해
+# 공백을 전부 제거한 버전에서 두 헤더 단어가 붙어있는지 검사한다.
+GLUED_HEADER_RE = re.compile(
+    "(?:" + "|".join(TABLE_HEADER_WORDS) + "){2,}"
+)
+SCHED_ROW_RE = re.compile(r"(?:[A-Za-z가-힣]\s?\d{1,3}\s?){3,}")
+# 헤더 단어와 무관하게, 공백으로만 구분된 짧은 숫자가 3개 이상 연속되는 경우
+# (표가 텍스트로 뭉개졌을 때의 공통 흔적). 콤마/소수점 나열은 제외.
+# 주의: 후위표기식(postfix) 같은 정상적인 한 자리 숫자 나열도 걸릴 수 있어 수동 확인 필요.
+BARE_NUM_RUN_RE = re.compile(r"(?:(?<![\d,.\-])\d{1,4}(?![\d,.%])\s+){2,}(?<![\d,.\-])\d{1,4}(?![\d,.%])")
+
+hits = []
+for r in rows:
+    text = r["question"]
+    compact = re.sub(r"\s+", "", text)
+    has_table_marker = bool(re.search(r"<[가-힣A-Za-z]+>", text))
+    has_long_digit_run = bool(re.search(r"\d{6,}", text))
+    trailing_dash = any(
+        r[c].rstrip().endswith("-") and not r[c].rstrip().endswith("--")
+        for c in ["choice1", "choice2", "choice3", "choice4"]
+    )
+    has_glued_header = bool(GLUED_HEADER_RE.search(compact))
+    has_sched_row = bool(SCHED_ROW_RE.search(text))
+    has_bare_num_run = bool(BARE_NUM_RUN_RE.search(text))
+    if (has_table_marker or has_long_digit_run or trailing_dash or has_glued_header
+            or has_sched_row or has_bare_num_run):
+        hits.append({
+            "id": r["id"], "round": r["round"], "source": r["source"],
+            "question": text, "c1": r["choice1"], "c2": r["choice2"],
+            "c3": r["choice3"], "c4": r["choice4"],
+            "reasons": [name for name, flag in [
+                ("table_marker", has_table_marker),
+                ("long_digit_run", has_long_digit_run),
+                ("trailing_dash", trailing_dash),
+                ("glued_header", has_glued_header),
+                ("sched_row", has_sched_row),
+                ("bare_num_run", has_bare_num_run),
+            ] if flag],
+        })
+
+out_path = os.path.join(OUT_DIR, "table_noise_hits.json")
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(hits, f, ensure_ascii=False, indent=1)
+print(len(hits))
