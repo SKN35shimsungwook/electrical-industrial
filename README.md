@@ -51,6 +51,22 @@ streamlit run app.py
 
 AI 코치 기능을 쓰려면 `.streamlit/secrets.toml.example`을 참고해서 Gemini API 키를 설정하세요.
 
+## 코드 구성
+
+`app.py`(화면) / `logic.py`(채점·출제 규칙) / `db.py`+`build_db.py`(SQLite 적재)로 역할이
+나뉘어 있고, `build_round_*.py` 스크립트들이 회차별 기출문제를 `data/questions.csv`로 정리해요.
+
+## 트러블슈팅
+
+이 저장소 자체의 커밋 기록은 대부분 **문제 데이터 추가**라서(회차별 기출 추가), 코드 버그 수정
+이력은 따로 없어요. 대신 `app.py`/`logic.py`는 첫 커밋부터 자매 프로젝트인
+[license(정보처리산업기사 퀴즈)](https://github.com/SKN35shimsungwook/license)를 그대로
+복제해서 만들어져서, 그 저장소에서 이미 고쳐진 버그 수정 코드를 처음부터 그대로 물려받았어요.
+(`_dedupe_by_core`, `cbt_answers_store`, `disabled=ss.quiz_answered` 등이 실제로 이
+저장소 코드에도 들어있는 걸 확인했어요.) 실제 문제가 뭐였고 어떻게 고쳐졌는지는
+[license 저장소 README의 트러블슈팅 섹션](https://github.com/SKN35shimsungwook/license#트러블슈팅)에
+자세히 정리돼 있어요.
+
 ---
 
 🤖 이 저장소의 README는 Claude Code와 함께 작성했어요.
